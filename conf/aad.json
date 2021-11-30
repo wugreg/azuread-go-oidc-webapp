@@ -1,0 +1,9 @@
+{
+    "clientId":"YOUR_APPLICATION_ID",
+    "authority":"https://login.microsoftonline.com/YOUR_TENANT_ID",
+    "secretKey":"YOUR_APPLICATION_SECRET",
+    "redirectUriSignin":"http://localhost:9090/secure/aad",
+    "redirectUriGraph":"http://localhost:9090/graph/me",
+    "msGraphEndpointHost":"https://graph.microsoft.com/v1.0",
+    "scope":""
+}

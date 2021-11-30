@@ -134,6 +134,7 @@ func routes(router *mux.Router) {
 		if !isAuthenticated(w, r) {
 			// Forward to Azure AD for authorize endpoint
 			sendAuthRedirect(w, r)
+			return
 		}
 
 		http.ServeFile(w, r, fmt.Sprintf("./%v/%v", PAGE_PATH, "index.html"))

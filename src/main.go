@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base32"
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
+	"github.com/gorilla/securecookie"
 	"github.com/gorilla/sessions"
 )
 
@@ -78,10 +80,13 @@ type GraphMeResponse struct {
 	ID        string `json:"id"`
 }
 
+type AccessToken struct {
+	Value string
+}
+
 var appConfig AppConfig
 var sessionStore = sessions.NewCookieStore([]byte(SESSION_STORE_NAME))
-var accessToken string
-var me GraphMeResponse
+var sessionMap map[string]*TokenResponse
 
 func init() {
 	data, err := ioutil.ReadFile("./conf/aad.json")
@@ -93,17 +98,18 @@ func init() {
 	}
 
 	gob.Register(StateDataMap{})
-	gob.Register(TokenResponse{})
+
+	sessionMap = make(map[string]*TokenResponse)
 }
 
 func main() {
-	fmt.Println("Hello, Microsoft")
+	fmt.Println("Hello, Azure")
 
 	startServer()
 }
 
 func startServer() {
-	fmt.Println("Starting web server")
+	fmt.Println("Starting Web server")
 
 	r := mux.NewRouter()
 	routes(r)
@@ -132,16 +138,25 @@ func routes(router *mux.Router) {
 		}
 
 		if !isAuthenticated(w, r) {
-			// Forward to Azure AD for authorize endpoint
+			// Forward to Azure AD authorize endpoint
 			sendAuthRedirect(w, r)
 			return
 		}
 
-		http.ServeFile(w, r, fmt.Sprintf("./%v/%v", PAGE_PATH, "index.html"))
+		//fmt.Println("Authenticated")
+		http.ServeFile(w, r, fmt.Sprintf("./%v/%v", PAGE_PATH, "secure.html"))
 	})
 
 	router.HandleFunc("/graph/me", func(w http.ResponseWriter, r *http.Request) {
-		callGraph(accessToken)
+		me := callGraph(r)
+
+		if me == nil {
+			u := User{
+				DisplayName:       "unknown",
+				UserPrincipalName: "unknown",
+			}
+			me = &GraphMeResponse{User: u}
+		}
 
 		keywordTemplate := template.Must(template.ParseFiles(fmt.Sprintf("./%v/%v", PAGE_PATH, "graph.html")))
 		err := keywordTemplate.Execute(w, me.User)
@@ -181,8 +196,7 @@ func processAuthenticationCodeRedirect(w http.ResponseWriter, r *http.Request, c
 	// Call AAD to get accessToken with code
 	tokenResponse := getAuthResultByAuthCode(oidcResponse.authCode)
 	if tokenResponse != nil {
-		accessToken = tokenResponse.AccessToken
-		setSessionPrincipal(w, r, accessToken)
+		setSessionPrincipal(w, r, tokenResponse)
 
 		http.ServeFile(w, r, fmt.Sprintf("%v/%v", PAGE_PATH, "secure.html"))
 		return
@@ -191,14 +205,23 @@ func processAuthenticationCodeRedirect(w http.ResponseWriter, r *http.Request, c
 	http.ServeFile(w, r, fmt.Sprintf("%v/%v", PAGE_PATH, "index.html"))
 }
 
-func callGraph(accessToken string) {
-	endpoint := appConfig.MsGraphEndpointHost + "/me"
+func callGraph(r *http.Request) *GraphMeResponse {
+	sessionID := getSessionID(r)
+	tokenResponse := sessionMap[sessionID]
+	if tokenResponse != nil {
+		endpoint := appConfig.MsGraphEndpointHost + "/me"
 
-	headers := make(map[string]string)
-	headers["Content-Type"] = "application/json"
-	headers["Authorization"] = "Bearer " + accessToken
+		headers := make(map[string]string)
+		headers["Content-Type"] = "application/json"
+		headers["Authorization"] = "Bearer " + tokenResponse.AccessToken
 
-	json.Unmarshal(doRequest(nil, endpoint, "GET", headers), &me)
+		var me GraphMeResponse
+		json.Unmarshal(doRequest(nil, endpoint, "GET", headers), &me)
+		return &me
+	}
+
+	fmt.Println("No access token, probably not authorized")
+	return nil
 }
 
 func getAuthResultByAuthCode(authCode string) *TokenResponse {
@@ -354,23 +377,41 @@ func getAuthorizationCodeUrl(claims string, state string, nonce string) string {
 		state)
 }
 
-func isAuthenticated(w http.ResponseWriter, r *http.Request) bool {
+func getSessionID(r *http.Request) string {
 	session, err := sessionStore.Get(r, SESSION_NAME)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return false
+		fmt.Println(err)
+		panic("Failed to get session")
 	}
 
-	return session.Values[PRINCIPAL_SESSION_NAME] != nil
+	sessionID, _ := session.Values[PRINCIPAL_SESSION_NAME].(string)
+	return sessionID
 }
 
-func setSessionPrincipal(w http.ResponseWriter, r *http.Request, accessToken string /*tokenResponse *TokenResponse*/) {
+func isAuthenticated(w http.ResponseWriter, r *http.Request) bool {
+	sessionID := getSessionID(r)
+
+	if sessionID != "" {
+		return sessionMap[sessionID] != nil
+	}
+
+	return false
+}
+
+func setSessionPrincipal(w http.ResponseWriter, r *http.Request, tokenResponse *TokenResponse) {
 	session, err := sessionStore.Get(r, SESSION_NAME)
 	if err != nil {
 		fmt.Println(err)
 	}
 
-	session.Values[PRINCIPAL_SESSION_NAME] = accessToken /*tokenResponse*/
+	if session.ID == "" {
+		// Generate a random session ID key suitable for storage in the DB
+		session.ID = string(securecookie.GenerateRandomKey(32))
+		session.ID = strings.TrimRight(base32.StdEncoding.EncodeToString(securecookie.GenerateRandomKey(32)), "=")
+	}
+	sessionMap[session.ID] = tokenResponse
+
+	session.Values[PRINCIPAL_SESSION_NAME] = session.ID
 	if err = session.Save(r, w); err != nil {
 		fmt.Println(err)
 	}

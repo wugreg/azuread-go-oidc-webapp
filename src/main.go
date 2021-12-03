@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/base32"
-	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,6 +25,7 @@ const (
 	SESSION_STORE_NAME     = "go-msid-secret"
 	SESSION_NAME           = "msid"
 	PRINCIPAL_SESSION_NAME = "principal"
+	STATE                  = "state"
 	STATES                 = "states"
 	DEFAULT_SCOPE          = "user.read"
 
@@ -45,10 +45,6 @@ type AppConfig struct {
 type StateData struct {
 	Nonce          string
 	ExpirationDate time.Time
-}
-
-type StateDataMap struct {
-	DataMap map[string]StateData
 }
 
 type AuthorizationResponse struct {
@@ -86,7 +82,7 @@ type AccessToken struct {
 
 var appConfig AppConfig
 var sessionStore = sessions.NewCookieStore([]byte(SESSION_STORE_NAME))
-var sessionMap map[string]*TokenResponse
+var tokenResponseMap map[string]*TokenResponse
 
 func init() {
 	data, err := ioutil.ReadFile("./conf/aad.json")
@@ -97,9 +93,9 @@ func init() {
 		json.Unmarshal(data, &appConfig)
 	}
 
-	gob.Register(StateDataMap{})
+	tokenResponseMap = make(map[string]*TokenResponse)
 
-	sessionMap = make(map[string]*TokenResponse)
+	sessionManager = make(map[string]map[string]interface{})
 }
 
 func main() {
@@ -125,10 +121,20 @@ func startServer() {
 
 func routes(router *mux.Router) {
 	router.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println("/")
+		if doHttpSession(w, r) == "" {
+			http.Error(w, "Could not process HTTP session", http.StatusInternalServerError)
+			return
+		}
 		http.ServeFile(w, r, fmt.Sprintf("%v/%v", PAGE_PATH, "index.html"))
 	})
 
 	router.HandleFunc("/secure/aad", func(w http.ResponseWriter, r *http.Request) {
+		if doHttpSession(w, r) == "" {
+			http.Error(w, "Could not process HTTP session", http.StatusInternalServerError)
+			return
+		}
+
 		if containsAuthenticationCode(r) {
 			currentUri := r.URL.Path
 			fullUrl := r.URL.RequestURI()
@@ -148,6 +154,11 @@ func routes(router *mux.Router) {
 	})
 
 	router.HandleFunc("/graph/me", func(w http.ResponseWriter, r *http.Request) {
+		if doHttpSession(w, r) == "" {
+			http.Error(w, "Could not process HTTP session", http.StatusInternalServerError)
+			return
+		}
+
 		me := callGraph(r)
 
 		if me == nil {
@@ -186,6 +197,18 @@ func containsAuthenticationCode(r *http.Request) bool {
 }
 
 func processAuthenticationCodeRedirect(w http.ResponseWriter, r *http.Request, currentUri string, fullUrl string) {
+	state := getFromResponse(r.URL.Query(), STATE)
+	if state == "" {
+		http.Error(w, "Could not validate state", http.StatusInternalServerError)
+		return
+	}
+
+	stateData := validateState(r, state)
+	if stateData == nil {
+		http.Error(w, "Could not validate state", http.StatusInternalServerError)
+		return
+	}
+
 	oidcResponse := parseAuthResponse(r)
 	if !isValiduthRespMatchesAuthCodeFlow(oidcResponse) {
 		fmt.Println(FAILED_TO_VALIDATE_MESSAGE + "unexpected set of artifacts received")
@@ -205,9 +228,31 @@ func processAuthenticationCodeRedirect(w http.ResponseWriter, r *http.Request, c
 	http.ServeFile(w, r, fmt.Sprintf("%v/%v", PAGE_PATH, "index.html"))
 }
 
+func validateState(r *http.Request, state string) *StateData {
+	return removeStateFromSession(r, state)
+}
+
+func removeStateFromSession(r *http.Request, state string) *StateData {
+	sessionID := getSessionID(r)
+	states, _ := sessionManager[sessionID][STATES].(map[string]*StateData)
+	if states != nil {
+		eliminateExpiredStates(states)
+		stateData := states[state]
+		if stateData != nil {
+			delete(states, state)
+			return stateData
+		}
+	}
+	return nil
+}
+
+func eliminateExpiredStates(states map[string]*StateData) {
+	//TODO
+}
+
 func callGraph(r *http.Request) *GraphMeResponse {
 	sessionID := getSessionID(r)
-	tokenResponse := sessionMap[sessionID]
+	tokenResponse := tokenResponseMap[sessionID]
 	if tokenResponse != nil {
 		endpoint := appConfig.MsGraphEndpointHost + "/me"
 
@@ -336,31 +381,23 @@ func sendAuthRedirect(w http.ResponseWriter, r *http.Request) {
 }
 
 func storeStateAndNonceInSession(w http.ResponseWriter, r *http.Request, state string, nonce string) {
-	session, err := sessionStore.Get(r, SESSION_NAME)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	sessionID := getSessionID(r)
+
+	sessionData := sessionManager[sessionID]
+	if sessionData == nil {
+		sessionData = make(map[string]interface{})
 	}
 
-	var stateDataMap StateDataMap
-	var ok bool
-
-	val := session.Values[STATES]
-	if stateDataMap, ok = val.(StateDataMap); !ok {
-		stateDataMap = StateDataMap{
-			DataMap: make(map[string]StateData),
-		}
+	states, _ := sessionData[STATES].(map[string]*StateData)
+	if states == nil {
+		states = make(map[string]*StateData)
 	}
-
-	stateDataMap.DataMap[state] = StateData{
+	states[state] = &StateData{
 		Nonce:          nonce,
 		ExpirationDate: time.Now(),
 	}
 
-	session.Values[STATES] = stateDataMap
-	if err = session.Save(r, w); err != nil {
-		fmt.Println(err)
-	}
+	saveToSession(sessionID, STATES, states)
 }
 
 func getAuthorizationCodeUrl(claims string, state string, nonce string) string {
@@ -377,22 +414,11 @@ func getAuthorizationCodeUrl(claims string, state string, nonce string) string {
 		state)
 }
 
-func getSessionID(r *http.Request) string {
-	session, err := sessionStore.Get(r, SESSION_NAME)
-	if err != nil {
-		fmt.Println(err)
-		panic("Failed to get session")
-	}
-
-	sessionID, _ := session.Values[PRINCIPAL_SESSION_NAME].(string)
-	return sessionID
-}
-
 func isAuthenticated(w http.ResponseWriter, r *http.Request) bool {
 	sessionID := getSessionID(r)
 
 	if sessionID != "" {
-		return sessionMap[sessionID] != nil
+		return tokenResponseMap[sessionID] != nil
 	}
 
 	return false
@@ -402,6 +428,7 @@ func setSessionPrincipal(w http.ResponseWriter, r *http.Request, tokenResponse *
 	session, err := sessionStore.Get(r, SESSION_NAME)
 	if err != nil {
 		fmt.Println(err)
+		panic("Failed to get session")
 	}
 
 	if session.ID == "" {
@@ -409,7 +436,7 @@ func setSessionPrincipal(w http.ResponseWriter, r *http.Request, tokenResponse *
 		session.ID = string(securecookie.GenerateRandomKey(32))
 		session.ID = strings.TrimRight(base32.StdEncoding.EncodeToString(securecookie.GenerateRandomKey(32)), "=")
 	}
-	sessionMap[session.ID] = tokenResponse
+	tokenResponseMap[session.ID] = tokenResponse
 
 	session.Values[PRINCIPAL_SESSION_NAME] = session.ID
 	if err = session.Save(r, w); err != nil {
